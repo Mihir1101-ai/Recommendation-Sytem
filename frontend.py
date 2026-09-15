@@ -1,8 +1,9 @@
-import os
+
 import pickle
 import numpy as np
 import pandas as pd
 import streamlit as st
+# h5py is required to read the saved .h5 LSTM weights without TensorFlow
 import h5py
 
 # Page Configuration
@@ -146,7 +147,7 @@ class TokenizerUnpickler(pickle.Unpickler):
 
 
 # Lightweight pad_sequences implementation
-def pad_sequences(sequences, maxlen=None, padding='pre'):
+def pad_sequences(sequences, maxlen=None, padding='pre', truncating='pre'):
     result = []
     for seq in sequences:
         if len(seq) < maxlen:
@@ -155,10 +156,12 @@ def pad_sequences(sequences, maxlen=None, padding='pre'):
             else:
                 padded = seq + [0] * (maxlen - len(seq))
         else:
-            if padding == 'pre':
-                padded = seq[-maxlen:]
+            if truncating == 'pre':
+                truncated = seq[-maxlen:]
             else:
-                padded = seq[:maxlen]
+                truncated = seq[:maxlen]
+
+            padded = truncated
         result.append(padded)
     return np.array(result)
 
@@ -264,7 +267,7 @@ def predict_next_words(model, tokenizer, max_len, text, top_k=5):
         return []
     
     # Pad sequence to max_len
-    padded = pad_sequences([sequence], maxlen=max_len, padding='pre')
+    padded = pad_sequences([sequence], maxlen=max_len, padding='post', truncating='post')
     
     # Get model probabilities
     predictions = model.predict(padded, verbose=0)[0]
@@ -297,7 +300,7 @@ def generate_text_sequence(model, tokenizer, max_len, seed_text, num_words=5, te
         if not sequence:
             break
         
-        padded = pad_sequences([sequence], maxlen=max_len, padding='pre')
+        padded = pad_sequences([sequence], maxlen=max_len, padding='post', truncating='post')
         preds = model.predict(padded, verbose=0)[0]
         
         # Temperature scaling
@@ -348,7 +351,7 @@ def main():
         st.session_state.user_prompt = "how are you"
         
     for sample in sample_prompts:
-        if st.sidebar.button(f"📌 {sample}", key=f"btn_{sample}", use_container_width=True):
+        if st.sidebar.button(f"📌 {sample}", key=f"btn_{sample}", width="stretch"):
             st.session_state.user_prompt = sample
             st.rerun()
             
@@ -416,7 +419,7 @@ def main():
                 for idx, item in enumerate(predictions):
                     with cols[idx]:
                         btn_label = f"➕ **{item['word']}**\n\n({item['percentage']:.1f}%)"
-                        if st.button(btn_label, key=f"append_{idx}_{item['word']}", use_container_width=True):
+                        if st.button(btn_label, key=f"append_{idx}_{item['word']}", width="stretch"):
                             # Append word to prompt and rerun
                             st.session_state.user_prompt = (prompt_input.strip() + " " + item['word']).strip()
                             st.rerun()
@@ -441,7 +444,7 @@ def main():
                 with st.expander("📊 View Detailed Confidence Scores Table"):
                     st.dataframe(
                         df_preds[['Word', 'Confidence (%)', 'probability']],
-                        use_container_width=True
+                        width="stretch"
                     )
                 st.markdown('</div>', unsafe_allow_html=True)
             else:
@@ -466,7 +469,7 @@ def main():
             temperature = st.slider("Creativity (Temperature):", min_value=0.1, max_value=1.5, value=0.7, step=0.1,
                                     help="Lower temperature values produce deterministic/predictable text. Higher values increase randomness and creativity.")
             
-        if st.button("🚀 Generate Sequence", key="btn_generate_text", use_container_width=True):
+        if st.button("🚀 Generate Sequence", key="btn_generate_text", width="stretch"):
             if gen_prompt.strip():
                 with st.spinner("Generating sequence using LSTM..."):
                     full_text, new_words = generate_text_sequence(
