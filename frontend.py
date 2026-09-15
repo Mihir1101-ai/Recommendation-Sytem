@@ -3,13 +3,7 @@ import pickle
 import numpy as np
 import pandas as pd
 import streamlit as st
-import tensorflow as tf
-# Suppress TensorFlow logging warnings
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
-
-
-from tensorflow.keras.preprocessing.sequence import pad_sequences
+import h5py
 
 # Page Configuration
 st.set_page_config(
@@ -116,17 +110,143 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+# Lightweight Tokenizer replacement for unpickling Keras tokenizer without TensorFlow/Keras
+class SimpleTokenizer:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+    def texts_to_sequences(self, texts):
+        sequences = []
+        for text in texts:
+            filters = '!"#$%&()*+,-./:;<=>?@[\\]^_`{|}~\t\n'
+            text = text.lower()
+            for c in filters:
+                text = text.replace(c, ' ')
+            words = text.split()
+            seq = []
+            for w in words:
+                idx = self.word_index.get(w)
+                if idx is not None:
+                    if hasattr(self, 'num_words') and self.num_words and idx >= self.num_words:
+                        continue
+                    seq.append(idx)
+                elif hasattr(self, 'oov_token') and self.oov_token:
+                    oov_idx = self.word_index.get(self.oov_token)
+                    if oov_idx:
+                        seq.append(oov_idx)
+            sequences.append(seq)
+        return sequences
+
+
+class TokenizerUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        if name == 'Tokenizer':
+            return SimpleTokenizer
+        return super().find_class(module, name)
+
+
+# Lightweight pad_sequences implementation
+def pad_sequences(sequences, maxlen=None, padding='pre'):
+    result = []
+    for seq in sequences:
+        if len(seq) < maxlen:
+            if padding == 'pre':
+                padded = [0] * (maxlen - len(seq)) + seq
+            else:
+                padded = seq + [0] * (maxlen - len(seq))
+        else:
+            if padding == 'pre':
+                padded = seq[-maxlen:]
+            else:
+                padded = seq[:maxlen]
+        result.append(padded)
+    return np.array(result)
+
+
+# Pure NumPy LSTM Inference Engine for next_word_lstm.h5
+class NumpyLSTMModel:
+    def __init__(self, h5_path):
+        with h5py.File(h5_path, 'r') as f:
+            mw = f['model_weights']
+            self.emb_weights = self._find_dataset(mw['embedding_2'])
+            
+            lstm_grp = mw['lstm_2']
+            self.lstm_kernel = self._find_dataset_by_name(lstm_grp, 'kernel')
+            self.lstm_rec_kernel = self._find_dataset_by_name(lstm_grp, 'recurrent_kernel')
+            self.lstm_bias = self._find_dataset_by_name(lstm_grp, 'bias')
+            
+            dense_grp = mw['dense_2']
+            self.dense_kernel = self._find_dataset_by_name(dense_grp, 'kernel')
+            self.dense_bias = self._find_dataset_by_name(dense_grp, 'bias')
+
+    def _find_dataset(self, group):
+        for k, v in group.items():
+            if isinstance(v, h5py.Dataset):
+                return v[:]
+            elif isinstance(v, h5py.Group):
+                res = self._find_dataset(v)
+                if res is not None:
+                    return res
+        return None
+
+    def _find_dataset_by_name(self, group, name):
+        if name in group and isinstance(group[name], h5py.Dataset):
+            return group[name][:]
+        for k, v in group.items():
+            if isinstance(v, h5py.Group):
+                res = self._find_dataset_by_name(v, name)
+                if res is not None:
+                    return res
+        return None
+
+    def predict(self, sequence_padded, verbose=0):
+        seqs = sequence_padded
+        results = []
+        units = self.lstm_rec_kernel.shape[0]
+
+        def sigmoid(x):
+            return 1.0 / (1.0 + np.exp(-np.clip(x, -30, 30)))
+
+        for seq in seqs:
+            h = np.zeros((units,), dtype=np.float32)
+            c = np.zeros((units,), dtype=np.float32)
+
+            for token in seq:
+                x_t = self.emb_weights[token]
+                z = np.dot(x_t, self.lstm_kernel) + np.dot(h, self.lstm_rec_kernel) + self.lstm_bias
+                
+                z_i = z[0:units]
+                z_f = z[units:2*units]
+                z_c = z[2*units:3*units]
+                z_o = z[3*units:4*units]
+
+                i_gate = sigmoid(z_i)
+                f_gate = sigmoid(z_f)
+                c_cand = np.tanh(z_c)
+                o_gate = sigmoid(z_o)
+
+                c = f_gate * c + i_gate * c_cand
+                h = o_gate * np.tanh(c)
+
+            logits = np.dot(h, self.dense_kernel) + self.dense_bias
+            exp_logits = np.exp(logits - np.max(logits))
+            probs = exp_logits / np.sum(exp_logits)
+            results.append(probs)
+
+        return np.array(results)
+
+
 # Cache Model & Artifact Loading for Optimal Performance
 @st.cache_resource
 def load_model_artifacts():
     try:
         with open('tokenizer.pkl', 'rb') as f:
-            tokenizer = pickle.load(f)
+            tokenizer = TokenizerUnpickler(f).load()
         
         with open('max_len.pkl', 'rb') as f:
             max_len = pickle.load(f)
             
-        model = tf.keras.models.load_model('next_word_lstm.h5')
+        model = NumpyLSTMModel('next_word_lstm.h5')
         return tokenizer, max_len, model, None
     except Exception as e:
         return None, None, None, str(e)
@@ -209,7 +329,7 @@ def main():
     - **Architecture**: `Embedding` (128) ➔ `LSTM` (128) ➔ `Dense` Softmax
     - **Vocabulary Size**: 6,739 unique tokens
     - **Max Sequence Length**: 30 words
-    - **Framework**: Keras / TensorFlow
+    - **Inference Engine**: Pure NumPy (TensorFlow-Free)
     """)
     st.sidebar.markdown("---")
     
